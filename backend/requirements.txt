@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+langchain
+langchain-google-genai
+python-dotenv
+langchain-core
+langchain-community
+google-api-python-client
+google-auth-oauthlib
+google-auth-httplib2
+tzlocal
