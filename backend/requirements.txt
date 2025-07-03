@@ -12,3 +12,4 @@ tzlocal
 pydantic
 python-multipart
 gunicorn
+python-dateutil

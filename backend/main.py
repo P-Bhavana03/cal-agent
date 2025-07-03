@@ -7,7 +7,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain.agents import create_tool_calling_agent, AgentExecutor
 from langchain.memory import ConversationBufferWindowMemory
-from tools import create_calendar_event, find_events, update_calendar_event, find_todays_events
+from tools import create_calendar_event, get_calendar_events, update_calendar_event, find_available_time_slots, get_event_details
 import datetime
 from tzlocal import get_localzone_name
 
@@ -35,7 +35,7 @@ app.add_middleware(
 llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
 
 # Define the tools
-tools = [create_calendar_event, find_events, update_calendar_event, find_todays_events]
+tools = [create_calendar_event, get_calendar_events, update_calendar_event, find_available_time_slots, get_event_details]
 
 # Global conversation memory
 memory = ConversationBufferWindowMemory(
@@ -62,10 +62,23 @@ The current date and time is {current_time_str}. Use this for any relative time 
 - When asked for event links, always check if you have the link from a recent tool response.
 - Never say you cannot provide information that was shared in our conversation.
 
-**Finding Events:**
-- When asked about "today's events" or "meetings today", use the `find_todays_events` tool directly.
-- For specific event searches (by title/keywords), use the `find_events` tool.
-- Always provide event links when available from tool responses.
+**Finding Events with `get_calendar_events`:**
+- This is your primary tool for finding any event. It provides a list with summary, time, duration, and ID.
+- To find events on a specific day, the LLM must convert terms like "today" or "tomorrow" into a specific 'YYYY-MM-DD' date for the `start_date` and `end_date` parameters.
+- **For today's events:** Set `start_date` and `end_date` to today's date.
+- **For tomorrow's events:** Set `start_date` and `end_date` to tomorrow's date.
+- **For events with a specific title:** Use the `query` parameter.
+- If a user is vague (e.g., "my next meeting"), you can call the tool with no parameters to get a list of all upcoming events.
+
+**Getting Specific Event Details:**
+- If the user asks for more details about a specific event (like its description or full attendee list), or if you need to confirm details before taking action, use the `get_event_details` tool.
+- You **must** provide the exact `event_id` from a previous search. Do not make up an ID.
+
+**Checking Availability:**
+- When a user asks if you can "find time," "check my availability," or asks for "free slots," use the `find_available_time_slots` tool.
+- The LLM must convert terms like "today" or "tomorrow" into a specific 'YYYY-MM-DD' date.
+- By default, assume a 30-minute duration unless the user specifies otherwise.
+- Example: "Find some time for a meeting tomorrow afternoon" -> Use `find_available_time_slots` with `start_date` set to tomorrow's date.
 
 **Event Creation and Information:**
 - When you create an event, always save and remember the event details including the link.
@@ -75,14 +88,14 @@ The current date and time is {current_time_str}. Use this for any relative time 
 **Workflow for Updating an Event:**
 1.  When the user asks to edit, modify, or change an event, your primary goal is to **update** it.
 2.  First, you **must** determine the event's title. If the user is vague (e.g., "edit my meeting"), ask for the title or keywords.
-3.  Use the `find_events` tool to search. The `query` parameter MUST ONLY be the event's title/keywords, not conversational text.
-4.  **If `find_events` returns "No upcoming events found", DO NOT give up.** Inform the user you couldn't find it and ask for a more specific title or different keywords. Do **NOT** suggest creating a new event unless the user asks you to.
+3.  Use the `get_calendar_events` tool to search. The `query` parameter MUST ONLY be the event's title/keywords, not conversational text.
+4.  **If `get_calendar_events` returns "No events found", DO NOT give up.** Inform the user you couldn't find it and ask for a more specific title or different keywords. Do **NOT** suggest creating a new event unless the user asks you to.
 5.  If you find multiple events, ask the user to clarify which one to edit.
-6.  Once you have the correct `event_id`, use `update_calendar_event` to apply the changes. Do **not** ask the user for the event ID.
+6.  Once you have the correct `event_id` from the tool's output, use `update_calendar_event` to apply the changes. The `event_id` is a short alphanumeric string. You **must** use the exact ID provided in the search results and not invent one.
 
 **Smart Update Example:**
 - User: "Move my 'Project Sync' meeting to 2 PM today."
-- Agent Action: First, find the "Project Sync" event. Then, call `update_calendar_event` with **only** the `start_time` set to 2 PM. The tool will handle the rest.
+- Agent Action: First, use `get_calendar_events` with `query='Project Sync'` to find the event. Then, call `update_calendar_event` with **only** the `start_time` set to 2 PM. The tool will handle the rest.
 
 **Conversation Context Examples:**
 - If you just created a "team meeting" and user asks "what's the link?", provide the link from the creation response.
@@ -118,6 +131,14 @@ async def chat(request: ChatRequest):
     """
     response = agent_executor.invoke({"input": request.query})
     return {"response": response["output"]}
+
+@app.post("/clear-history")
+async def clear_history():
+    """
+    Clears the conversation memory.
+    """
+    memory.clear()
+    return {"status": "history cleared"}
 
 @app.get("/")
 def read_root():

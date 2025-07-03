@@ -43,6 +43,13 @@ def send_message(message):
 col1, col2 = st.columns([4, 1])
 with col2:
     if st.button("🗑️ Clear Chat", help="Clear the conversation history"):
+        # Clear backend memory
+        try:
+            requests.post(f"{BACKEND_URL}/clear-history")
+        except requests.exceptions.RequestException as e:
+            st.error(f"Failed to clear chat history on the server: {e}")
+        
+        # Clear frontend state
         st.session_state.messages = []
         st.rerun()
 

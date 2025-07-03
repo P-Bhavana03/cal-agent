@@ -10,9 +10,11 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from tzlocal import get_localzone_name
+from dateutil.parser import parse as date_parse
+from dateutil.tz import gettz
 
 # Use the more specific .events scope. This may require re-authentication.
-SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
+SCOPES = ["https://www.googleapis.com/auth/calendar.events", "https://www.googleapis.com/auth/calendar.readonly"]
 
 def get_calendar_service():
     """Handles Google Calendar API authentication and returns a service object."""
@@ -111,57 +113,148 @@ You can click the link above to view or edit the event in Google Calendar."""
     except (HttpError, FileNotFoundError, ValueError) as error:
         return f"An error occurred: {error}"
 
-@tool
-def find_events(query: str, max_results: int = 10) -> str:
-    """
-    Searches for an event in the user's calendar based on its title or keywords.
+class GetCalendarEventsInput(BaseModel):
+    start_date: Optional[str] = Field(None, description="The start date for the event search, in 'YYYY-MM-DD' format. If not provided, the search starts from the current time.")
+    end_date: Optional[str] = Field(None, description="The end date for the event search, in 'YYYY-MM-DD' format. If not provided, it defaults to the start_date.")
+    query: Optional[str] = Field(None, description="A keyword query to search for in event titles.")
+    max_results: int = Field(10, description="The maximum number of events to return.")
 
-    **Instructions for the 'query' parameter:**
-    - Use this tool to get an event's ID before you can update it.
-    - The 'query' should **only** contain the essential title or keywords of the event.
-    - **DO NOT** include dates, times, or conversational words like "my", "the", "for tomorrow".
-    
-    **Correct Usage Examples:**
-    - User says: "edit my meeting about the Project Launch tomorrow" -> query: "Project Launch"
-    - User says: "change the weekly sync at 10am" -> query: "weekly sync"
-    - User says: "Find the dental appointment" -> query: "dental appointment"
-    
-    **Incorrect Usage:**
-    - User says: "edit tomorrow's meeting" -> DO NOT use query: "tomorrow's meeting"
+@tool("get_calendar_events", args_schema=GetCalendarEventsInput)
+def get_calendar_events(start_date: Optional[str] = None, end_date: Optional[str] = None, query: Optional[str] = None, max_results: int = 10) -> str:
+    """
+    Searches for events in the user's calendar.
+    It can search by a date range, a text query, or both.
+    If no dates are provided, it searches for all upcoming future events.
     """
     try:
         service = get_calendar_service()
-        now = datetime.datetime.utcnow().isoformat() + "Z"
-        events_result = (
-            service.events()
-            .list(
-                calendarId="primary",
-                q=query,
-                timeMin=now,
-                maxResults=max_results,
-                singleEvents=True,
-                orderBy="startTime",
-            )
-            .execute()
-        )
+        local_tz_name = get_localzone_name()
+        local_tz = gettz(local_tz_name)
+
+        time_min = None
+        time_max = None
+
+        if start_date:
+            try:
+                start_dt = date_parse(start_date)
+                # Localize the start time to the beginning of the day
+                time_min = datetime.datetime.combine(start_dt.date(), datetime.time.min).astimezone(local_tz).isoformat()
+            except ValueError:
+                return "Error: Invalid start_date format. Please use YYYY-MM-DD."
+        else:
+            # If no start date, search from now
+            time_min = datetime.datetime.utcnow().isoformat() + "Z"
+
+        if end_date:
+            try:
+                end_dt = date_parse(end_date)
+                # Localize the end time to the end of the day
+                time_max = datetime.datetime.combine(end_dt.date(), datetime.time.max).astimezone(local_tz).isoformat()
+            except ValueError:
+                return "Error: Invalid end_date format. Please use YYYY-MM-DD."
+        elif start_date:
+            # If start_date is given but not end_date, search for the whole day.
+            start_dt = date_parse(start_date)
+            time_max = datetime.datetime.combine(start_dt.date(), datetime.time.max).astimezone(local_tz).isoformat()
+
+        list_kwargs = {
+            "calendarId": "primary",
+            "timeMin": time_min,
+            "maxResults": max_results,
+            "singleEvents": True,
+            "orderBy": "startTime",
+        }
+        if time_max:
+            list_kwargs["timeMax"] = time_max
+        if query:
+            list_kwargs["q"] = query
+
+        events_result = service.events().list(**list_kwargs).execute()
         events = events_result.get("items", [])
+
         if not events:
-            return "No upcoming events found matching that query."
-        
+            return "No events found matching your criteria."
+
         result = "📅 **Found the following events:**\n\n"
         for i, event in enumerate(events, 1):
             start = event["start"].get("dateTime", event["start"].get("date"))
-            event_link = event.get("htmlLink", "No link available")
+            start_dt = date_parse(start)
+
+            if 'dateTime' in event['start']:
+                time_info = start_dt.astimezone(local_tz).strftime("%I:%M %p").lstrip('0')
+                end_str = event["end"].get("dateTime", event["end"].get("date"))
+                end_dt = date_parse(end_str)
+                end_time_info = end_dt.astimezone(local_tz).strftime("%I:%M %p").lstrip('0')
+                duration = end_dt - start_dt
+                duration_str = f"({duration})"
+            else:
+                time_info = "All-day"
+                end_time_info = ""
+                duration_str = ""
+
             event_summary = event.get("summary", "No title")
             event_id = event.get("id", "No ID")
+            event_link = event.get('htmlLink', 'No link available')
             
             result += f"{i}. **{event_summary}**\n"
-            result += f"   - Starts: {start}\n"
-            result += f"   - ID: {event_id}\n"
-            result += f"   - 🔗 Link: {event_link}\n\n"
+            result += f"   - Time: {time_info} to {end_time_info} {duration_str}\n"
+            result += f"   - ID: `{event_id}`\n"
+            result += f"   - Link: [View Event]({event_link})\n\n"
         
         return result
     except (HttpError, FileNotFoundError, ValueError) as error:
+        return f"An error occurred: {error}"
+
+class GetEventDetailsInput(BaseModel):
+    event_id: str = Field(description="The unique ID of the event to get details for.")
+
+@tool("get_event_details", args_schema=GetEventDetailsInput)
+def get_event_details(event_id: str) -> str:
+    """
+    Fetches the complete details for a single calendar event using its ID.
+    """
+    try:
+        service = get_calendar_service()
+        event = service.events().get(calendarId="primary", eventId=event_id).execute()
+        local_tz = gettz(get_localzone_name())
+
+        # Extract details
+        summary = event.get("summary", "No Title")
+        description = event.get("description", "No description provided.")
+        start_str = event["start"].get("dateTime", event["start"].get("date"))
+        end_str = event["end"].get("dateTime", event["end"].get("date"))
+        
+        start_dt = date_parse(start_str).astimezone(local_tz)
+        end_dt = date_parse(end_str).astimezone(local_tz)
+
+        if 'dateTime' in event['start']:
+            time_str = f"{start_dt.strftime('%A, %B %d, %Y from %I:%M %p')} to {end_dt.strftime('%I:%M %p %Z')}"
+            duration = end_dt - start_dt
+            duration_str = str(duration)
+        else:
+            time_str = f"{start_dt.strftime('%A, %B %d, %Y')} (All-day)"
+            duration_str = "All-day event"
+
+        attendees = event.get("attendees", [])
+        attendee_list = "\n".join([f"- {att['email']}" for att in attendees]) if attendees else "No attendees."
+        
+        event_link = event.get('htmlLink', 'No link available')
+
+        return f"""✅ **Event Details**
+- **Title:** {summary}
+- **Time:** {time_str}
+- **Duration:** {duration_str}
+- **Description:** {description}
+- **Attendees:**
+{attendee_list}
+- **Event ID:** `{event_id}`
+- **Link:** [View in Google Calendar]({event_link})"""
+
+    except HttpError as error:
+        if error.resp.status == 404:
+            return f"Error: No event found with ID '{event_id}'."
+        return f"An error occurred: {error}"
+    except (FileNotFoundError, ValueError) as error:
         return f"An error occurred: {error}"
 
 class UpdateEventInput(BaseModel):
@@ -178,13 +271,17 @@ def update_calendar_event(event_id: str, **kwargs) -> str:
     """
     Updates an existing calendar event using its ID.
     
-    This tool is smart: if you provide only a new start_time, it will automatically
-    adjust the end_time to preserve the event's original duration.
+    This tool is smart:
+    - If you provide only a new start_time, it will automatically adjust the end_time to preserve the event's original duration.
+    - It automatically handles timezone conversions.
     """
     try:
         service = get_calendar_service()
         event = service.events().get(calendarId="primary", eventId=event_id).execute()
-        local_timezone = get_localzone_name()
+        
+        # Use the timezone from the original event or fallback to local timezone
+        event_timezone = event.get('start', {}).get('timeZone', get_localzone_name())
+        tz = gettz(event_timezone)
 
         update_data = {k: v for k, v in kwargs.items() if v is not None}
         
@@ -192,46 +289,51 @@ def update_calendar_event(event_id: str, **kwargs) -> str:
         if 'start_time' in update_data and 'end_time' not in update_data:
             start_dt_str = event['start'].get('dateTime')
             end_dt_str = event['end'].get('dateTime')
+            
             if start_dt_str and end_dt_str:
-                original_start = datetime.datetime.fromisoformat(start_dt_str)
-                original_end = datetime.datetime.fromisoformat(end_dt_str)
+                original_start = date_parse(start_dt_str)
+                original_end = date_parse(end_dt_str)
                 duration = original_end - original_start
                 
-                # Use the provided start_time to calculate the new end_time
-                new_start = datetime.datetime.fromisoformat(update_data['start_time'])
+                new_start = date_parse(update_data['start_time']).astimezone(tz)
                 new_end = new_start + duration
                 
                 event['start']['dateTime'] = new_start.isoformat()
                 event['end']['dateTime'] = new_end.isoformat()
-                # Unset them from update_data to avoid double processing
                 del update_data['start_time']
 
         if 'summary' in update_data:
             event['summary'] = update_data['summary']
         if 'description' in update_data:
             event['description'] = update_data['description']
-        # Handle cases where start/end time are explicitly provided together
+        
         if 'start_time' in update_data:
-            event['start']['dateTime'] = update_data['start_time']
-            event['start']['timeZone'] = local_timezone
+            start_dt = date_parse(update_data['start_time']).astimezone(tz)
+            event['start'] = {'dateTime': start_dt.isoformat(), 'timeZone': event_timezone}
+        
         if 'end_time' in update_data:
-            event['end']['dateTime'] = update_data['end_time']
-            event['end']['timeZone'] = local_timezone
+            end_dt = date_parse(update_data['end_time']).astimezone(tz)
+            event['end'] = {'dateTime': end_dt.isoformat(), 'timeZone': event_timezone}
 
-        if 'attendees' not in event:
-            event['attendees'] = []
-            
         if 'attendees_to_add' in update_data:
-            existing_emails = {a['email'] for a in event['attendees']}
+            if 'attendees' not in event:
+                event['attendees'] = []
+            existing_emails = {a['email'] for a in event.get('attendees', [])}
             for email in update_data['attendees_to_add']:
                 if email not in existing_emails:
                     event['attendees'].append({'email': email})
 
         if 'attendees_to_remove' in update_data:
-            emails_to_remove = set(update_data['attendees_to_remove'])
-            event['attendees'] = [a for a in event['attendees'] if a['email'] not in emails_to_remove]
+            if 'attendees' in event:
+                emails_to_remove = set(update_data['attendees_to_remove'])
+                event['attendees'] = [a for a in event['attendees'] if a.get('email') not in emails_to_remove]
 
-        updated_event = service.events().update(calendarId="primary", eventId=event_id, body=event).execute()
+        updated_event = service.events().update(
+            calendarId="primary", 
+            eventId=event_id, 
+            body=event,
+            sendUpdates='all' # Notify attendees of the changes
+        ).execute()
         
         event_link = updated_event.get('htmlLink', 'No link available')
         event_title = updated_event.get('summary', 'Unknown')
@@ -248,57 +350,161 @@ You can click the link above to view the updated event in Google Calendar."""
     except (HttpError, FileNotFoundError, ValueError) as error:
         return f"An error occurred: {error}"
 
-@tool
-def find_todays_events() -> str:
+class FindAvailabilityInput(BaseModel):
+    start_date: str = Field(description="Start date in ISO format 'YYYY-MM-DD'")
+    end_date: Optional[str] = Field(None, description="End date in ISO format 'YYYY-MM-DD'. If not provided, only the start_date is checked.")
+    start_hour: int = Field(9, description="Start of working hours (24-hour format, default 9 for 9 AM)")
+    end_hour: int = Field(17, description="End of working hours (24-hour format, default 17 for 5 PM)")
+    duration_minutes: int = Field(30, description="Duration of the meeting in minutes")
+
+@tool("find_available_time_slots", args_schema=FindAvailabilityInput)
+def find_available_time_slots(start_date: str, end_date: Optional[str] = None, start_hour: int = 9, end_hour: int = 17, duration_minutes: int = 30) -> str:
     """
-    Lists all events scheduled for today in the user's calendar.
+    Finds available time slots in the user's calendar within a given date range and working hours.
+    
+    Args:
+        start_date: Date in ISO format 'YYYY-MM-DD'
+        end_date: Optional. Date in ISO format 'YYYY-MM-DD'
+        start_hour: Start of working hours (24-hour format, default 9 for 9 AM)
+        end_hour: End of working hours (24-hour format, default 17 for 5 PM)
+        duration_minutes: Duration of the meeting in minutes (default 30)
     """
     try:
         service = get_calendar_service()
-        local_timezone = get_localzone_name()
-        
-        # Get today's start and end times in local timezone
-        today = datetime.datetime.now()
-        start_of_day = datetime.datetime.combine(today, datetime.time.min)
-        end_of_day = datetime.datetime.combine(today, datetime.time.max)
-        
-        # Convert to UTC for the API
-        start_of_day = start_of_day.astimezone(datetime.timezone.utc).isoformat()
-        end_of_day = end_of_day.astimezone(datetime.timezone.utc).isoformat()
-        
-        events_result = (
-            service.events()
-            .list(
-                calendarId="primary",
-                timeMin=start_of_day,
-                timeMax=end_of_day,
-                singleEvents=True,
-                orderBy="startTime",
-            )
-            .execute()
-        )
-        events = events_result.get("items", [])
-        
-        if not events:
-            return "No events scheduled for today."
-        
-        result = "📅 **Today's Events:**\n\n"
-        for i, event in enumerate(events, 1):
-            start = event["start"].get("dateTime", event["start"].get("date"))
-            event_link = event.get("htmlLink", "No link available")
-            event_summary = event.get("summary", "No title")
-            event_id = event.get("id", "No ID")
+        local_tz_name = get_localzone_name()
+        local_tz = gettz(local_tz_name)
+        now = datetime.datetime.now(local_tz)
+
+        # Parse dates
+        try:
+            parsed_start_date = date_parse(start_date).date()
+            parsed_end_date = date_parse(end_date).date() if end_date else parsed_start_date
+        except ValueError:
+            return "Error: Dates must be in YYYY-MM-DD format."
+
+        # Validate dates
+        if parsed_start_date < now.date():
+            parsed_start_date = now.date()
             
-            # Convert the start time to local timezone for display
-            if "T" in start:  # If it's a datetime (not just a date)
-                start_dt = datetime.datetime.fromisoformat(start)
-                start = start_dt.astimezone().strftime("%I:%M %p")  # Format as "HH:MM AM/PM"
-            
-            result += f"{i}. **{event_summary}**\n"
-            result += f"   - Time: {start}\n"
-            result += f"   - ID: {event_id}\n"
-            result += f"   - 🔗 Link: {event_link}\n\n"
+        if parsed_start_date > parsed_end_date:
+            return "Error: The start date must be before or the same as the end date."
+
+        # Validate hours
+        if not (0 <= start_hour <= 23 and 0 <= end_hour <= 23):
+            return "Error: Hours must be between 0 and 23."
+        if start_hour >= end_hour:
+            return "Error: Start hour must be before end hour."
+        if duration_minutes <= 0 or duration_minutes > 1440:  # 1440 = 24 hours
+            return "Error: Duration must be between 1 and 1440 minutes."
+
+        time_min_dt = datetime.datetime.combine(parsed_start_date, datetime.time(0, 0), tzinfo=local_tz)
+        time_max_dt = datetime.datetime.combine(parsed_end_date, datetime.time(23, 59, 59), tzinfo=local_tz)
+
+        freebusy_request = {
+            "timeMin": time_min_dt.isoformat(),
+            "timeMax": time_max_dt.isoformat(),
+            "timeZone": local_tz_name,
+            "items": [{"id": "primary"}],
+        }
+
+        freebusy_result = service.freebusy().query(body=freebusy_request).execute()
+        busy_slots = freebusy_result.get("calendars", {}).get("primary", {}).get("busy", [])
         
-        return result
-    except (HttpError, FileNotFoundError, ValueError) as error:
+        busy_times = sorted([(date_parse(slot['start']), date_parse(slot['end'])) for slot in busy_slots])
+
+        available_slots_str = ""
+        current_date = parsed_start_date
+        duration = datetime.timedelta(minutes=duration_minutes)
+
+        while current_date <= parsed_end_date:
+            day_slots = []
+            
+            work_start = datetime.datetime.combine(current_date, datetime.time(start_hour, 0), tzinfo=local_tz)
+            work_end = datetime.datetime.combine(current_date, datetime.time(end_hour, 0), tzinfo=local_tz)
+
+            if current_date == now.date():
+                search_start = max(now, work_start)
+            else:
+                search_start = work_start
+
+            if search_start >= work_end:
+                current_date += datetime.timedelta(days=1)
+                continue
+
+            current_time = search_start
+
+            # Filter busy times for current day
+            day_busy_times = [
+                (s.astimezone(local_tz), e.astimezone(local_tz))
+                for s, e in busy_times 
+                if s.date() <= current_date <= e.date()
+            ]
+
+            # Merge overlapping busy times
+            merged_busy_times = []
+            for busy_start, busy_end in sorted(day_busy_times):
+                if not merged_busy_times or busy_start > merged_busy_times[-1][1]:
+                    merged_busy_times.append([busy_start, busy_end])
+                else:
+                    merged_busy_times[-1][1] = max(merged_busy_times[-1][1], busy_end)
+            
+            # Find free slots between busy times
+            for busy_start, busy_end in merged_busy_times:
+                free_end = min(busy_start, work_end)
+                if current_time < free_end:
+                    slot_start = current_time
+                    while slot_start + duration <= free_end:
+                        slot_end = slot_start + duration
+                        try:
+                            day_slots.append(
+                                f"{slot_start.strftime('%I:%M %p').lstrip('0')} to "
+                                f"{slot_end.strftime('%I:%M %p').lstrip('0')}"
+                            )
+                        except ValueError:
+                            continue
+                        slot_start += duration
+                current_time = max(current_time, busy_end)
+
+            # Add remaining slots after last busy time
+            if current_time < work_end:
+                slot_start = current_time
+                while slot_start + duration <= work_end:
+                    slot_end = slot_start + duration
+                    try:
+                        day_slots.append(
+                            f"{slot_start.strftime('%I:%M %p').lstrip('0')} to "
+                            f"{slot_end.strftime('%I:%M %p').lstrip('0')}"
+                        )
+                    except ValueError:
+                        continue
+                    slot_start += duration
+
+            if day_slots:
+                try:
+                    date_str = current_date.strftime('%A, %B %d')
+                    available_slots_str += f"\n🗓️ **{date_str}**:\n" + "\n".join(f"- {s}" for s in day_slots)
+                except ValueError:
+                    continue
+            
+            current_date += datetime.timedelta(days=1)
+
+        if not available_slots_str:
+            try:
+                date_range = (
+                    f"{parsed_start_date.strftime('%Y-%m-%d')} to {parsed_end_date.strftime('%Y-%m-%d')}"
+                    if parsed_end_date != parsed_start_date
+                    else f"{parsed_start_date.strftime('%Y-%m-%d')}"
+                )
+                return (
+                    f"No available slots of {duration_minutes} minutes found for {date_range} "
+                    f"between {start_hour:02d}:00 and {end_hour:02d}:00."
+                )
+            except ValueError:
+                return "No available slots found for the specified time range."
+
+        return "✅ Here are the available time slots:\n" + available_slots_str
+
+    except (HttpError, FileNotFoundError) as error:
         return f"An error occurred: {error}"
+    except Exception as e:
+        return f"An unexpected error occurred: {str(e)}"
