@@ -17,27 +17,59 @@ SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
 def get_calendar_service():
     """Handles Google Calendar API authentication and returns a service object."""
     creds = None
-    if os.path.exists("token.json"):
-        creds = Credentials.from_authorized_user_file("token.json", SCOPES)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            if not os.path.exists("credentials.json"):
-                raise FileNotFoundError("Error: credentials.json not found. Please follow README instructions.")
+    
+    # Try to get credentials from environment variables first (for deployment)
+    if os.getenv("GOOGLE_CREDENTIALS_JSON") and os.getenv("GOOGLE_TOKEN_JSON"):
+        try:
+            # Load credentials from environment variables
+            google_credentials_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
+            google_token_json = os.getenv("GOOGLE_TOKEN_JSON")
             
-            try:
-                with open("credentials.json", 'r') as f:
-                    client_config = json.load(f)
-                    if "installed" not in client_config and "web" not in client_config:
-                        raise ValueError("Error: Invalid credentials.json. Please use 'Desktop app' credentials.")
-            except json.JSONDecodeError:
-                raise ValueError("Error: Malformed credentials.json. Please re-download it.")
+            if google_credentials_json is None or google_token_json is None:
+                raise ValueError("Environment variables are None")
+                
+            credentials_data = json.loads(google_credentials_json)
+            token_data = json.loads(google_token_json)
+            
+            creds = Credentials.from_authorized_user_info(token_data, SCOPES)
+            # Refresh token if needed
+            if not creds.valid and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+                
+        except (json.JSONDecodeError, Exception) as e:
+            print(f"Error loading credentials from environment: {e}")
+            creds = None
+    
+    # Fallback to file-based authentication (for local development)
+    if not creds or not creds.valid:
+        if os.path.exists("token.json"):
+            creds = Credentials.from_authorized_user_file("token.json", SCOPES)
+        
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            else:
+                if not os.path.exists("credentials.json") and not os.getenv("GOOGLE_CREDENTIALS_JSON"):
+                    raise FileNotFoundError("Error: credentials.json not found and GOOGLE_CREDENTIALS_JSON not set. Please follow README instructions.")
+                
+                if os.path.exists("credentials.json"):
+                    try:
+                        with open("credentials.json", 'r') as f:
+                            client_config = json.load(f)
+                            if "installed" not in client_config and "web" not in client_config:
+                                raise ValueError("Error: Invalid credentials.json. Please use 'Desktop app' credentials.")
+                    except json.JSONDecodeError:
+                        raise ValueError("Error: Malformed credentials.json. Please re-download it.")
 
-            flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open("token.json", "w") as token:
-            token.write(creds.to_json())
+                    flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
+                    creds = flow.run_local_server(port=0)
+                else:
+                    raise FileNotFoundError("Error: No credentials available. Please set environment variables or provide credentials.json file.")
+                
+            # Save token for local development only
+            if os.path.exists("credentials.json"):
+                with open("token.json", "w") as token:
+                    token.write(creds.to_json())
     
     return build("calendar", "v3", credentials=creds)
 
