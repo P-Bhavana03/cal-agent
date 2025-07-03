@@ -373,7 +373,7 @@ def find_available_time_slots(start_date: str, end_date: Optional[str] = None, s
         service = get_calendar_service()
         local_tz_name = get_localzone_name()
         local_tz = gettz(local_tz_name)
-        now = datetime.datetime.now(local_tz)
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
 
         # Parse dates
         try:
@@ -383,8 +383,8 @@ def find_available_time_slots(start_date: str, end_date: Optional[str] = None, s
             return "Error: Dates must be in YYYY-MM-DD format."
 
         # Validate dates
-        if parsed_start_date < now.date():
-            parsed_start_date = now.date()
+        if parsed_start_date < now_utc.astimezone(local_tz).date():
+            parsed_start_date = now_utc.astimezone(local_tz).date()
             
         if parsed_start_date > parsed_end_date:
             return "Error: The start date must be before or the same as the end date."
@@ -394,23 +394,25 @@ def find_available_time_slots(start_date: str, end_date: Optional[str] = None, s
             return "Error: Hours must be between 0 and 23."
         if start_hour >= end_hour:
             return "Error: Start hour must be before end hour."
-        if duration_minutes <= 0 or duration_minutes > 1440:  # 1440 = 24 hours
+        if duration_minutes <= 0 or duration_minutes > 1440:
             return "Error: Duration must be between 1 and 1440 minutes."
 
-        time_min_dt = datetime.datetime.combine(parsed_start_date, datetime.time(0, 0), tzinfo=local_tz)
-        time_max_dt = datetime.datetime.combine(parsed_end_date, datetime.time(23, 59, 59), tzinfo=local_tz)
+        # Perform core logic in UTC
+        time_min_utc = datetime.datetime.combine(parsed_start_date, datetime.time.min, tzinfo=local_tz).astimezone(datetime.timezone.utc)
+        time_max_utc = datetime.datetime.combine(parsed_end_date, datetime.time.max, tzinfo=local_tz).astimezone(datetime.timezone.utc)
 
         freebusy_request = {
-            "timeMin": time_min_dt.isoformat(),
-            "timeMax": time_max_dt.isoformat(),
-            "timeZone": local_tz_name,
+            "timeMin": time_min_utc.isoformat(),
+            "timeMax": time_max_utc.isoformat(),
+            "timeZone": local_tz_name, # Use local TZ for Google to interpret days correctly
             "items": [{"id": "primary"}],
         }
 
         freebusy_result = service.freebusy().query(body=freebusy_request).execute()
         busy_slots = freebusy_result.get("calendars", {}).get("primary", {}).get("busy", [])
         
-        busy_times = sorted([(date_parse(slot['start']), date_parse(slot['end'])) for slot in busy_slots])
+        # All busy times are parsed as timezone-aware UTC objects
+        busy_times_utc = sorted([(date_parse(slot['start']), date_parse(slot['end'])) for slot in busy_slots])
 
         available_slots_str = ""
         current_date = parsed_start_date
@@ -419,65 +421,61 @@ def find_available_time_slots(start_date: str, end_date: Optional[str] = None, s
         while current_date <= parsed_end_date:
             day_slots = []
             
-            work_start = datetime.datetime.combine(current_date, datetime.time(start_hour, 0), tzinfo=local_tz)
-            work_end = datetime.datetime.combine(current_date, datetime.time(end_hour, 0), tzinfo=local_tz)
+            # Define work day in local time, then convert to UTC
+            work_start_local = datetime.datetime.combine(current_date, datetime.time(start_hour, 0), tzinfo=local_tz)
+            work_end_local = datetime.datetime.combine(current_date, datetime.time(end_hour, 0), tzinfo=local_tz)
+            work_start_utc = work_start_local.astimezone(datetime.timezone.utc)
+            work_end_utc = work_end_local.astimezone(datetime.timezone.utc)
 
-            if current_date == now.date():
-                search_start = max(now, work_start)
-            else:
-                search_start = work_start
+            # Determine search start time in UTC
+            search_start_utc = max(now_utc, work_start_utc)
 
-            if search_start >= work_end:
+            if search_start_utc >= work_end_utc:
                 current_date += datetime.timedelta(days=1)
                 continue
 
-            current_time = search_start
+            current_time_utc = search_start_utc
 
-            # Filter busy times for current day
-            day_busy_times = [
-                (s.astimezone(local_tz), e.astimezone(local_tz))
-                for s, e in busy_times 
-                if s.date() <= current_date <= e.date()
+            # Filter busy times for the current day's working hours
+            day_busy_times_utc = [
+                (s, e) for s, e in busy_times_utc 
+                if s < work_end_utc and e > work_start_utc
             ]
 
-            # Merge overlapping busy times
             merged_busy_times = []
-            for busy_start, busy_end in sorted(day_busy_times):
+            for busy_start, busy_end in sorted(day_busy_times_utc):
                 if not merged_busy_times or busy_start > merged_busy_times[-1][1]:
                     merged_busy_times.append([busy_start, busy_end])
                 else:
                     merged_busy_times[-1][1] = max(merged_busy_times[-1][1], busy_end)
             
-            # Find free slots between busy times
             for busy_start, busy_end in merged_busy_times:
-                free_end = min(busy_start, work_end)
-                if current_time < free_end:
-                    slot_start = current_time
-                    while slot_start + duration <= free_end:
-                        slot_end = slot_start + duration
-                        try:
-                            day_slots.append(
-                                f"{slot_start.strftime('%I:%M %p').lstrip('0')} to "
-                                f"{slot_end.strftime('%I:%M %p').lstrip('0')}"
-                            )
-                        except ValueError:
-                            continue
-                        slot_start += duration
-                current_time = max(current_time, busy_end)
-
-            # Add remaining slots after last busy time
-            if current_time < work_end:
-                slot_start = current_time
-                while slot_start + duration <= work_end:
-                    slot_end = slot_start + duration
-                    try:
+                free_end_utc = min(busy_start, work_end_utc)
+                if current_time_utc < free_end_utc:
+                    slot_start_utc = current_time_utc
+                    while slot_start_utc + duration <= free_end_utc:
+                        slot_end_utc = slot_start_utc + duration
+                        # Convert back to local time for display
+                        slot_start_local = slot_start_utc.astimezone(local_tz)
+                        slot_end_local = slot_end_utc.astimezone(local_tz)
                         day_slots.append(
-                            f"{slot_start.strftime('%I:%M %p').lstrip('0')} to "
-                            f"{slot_end.strftime('%I:%M %p').lstrip('0')}"
+                            f"{slot_start_local.strftime('%I:%M %p').lstrip('0')} to "
+                            f"{slot_end_local.strftime('%I:%M %p').lstrip('0')}"
                         )
-                    except ValueError:
-                        continue
-                    slot_start += duration
+                        slot_start_utc += duration
+                current_time_utc = max(current_time_utc, busy_end)
+
+            if current_time_utc < work_end_utc:
+                slot_start_utc = current_time_utc
+                while slot_start_utc + duration <= work_end_utc:
+                    slot_end_utc = slot_start_utc + duration
+                    slot_start_local = slot_start_utc.astimezone(local_tz)
+                    slot_end_local = slot_end_utc.astimezone(local_tz)
+                    day_slots.append(
+                        f"{slot_start_local.strftime('%I:%M %p').lstrip('0')} to "
+                        f"{slot_end_local.strftime('%I:%M %p').lstrip('0')}"
+                    )
+                    slot_start_utc += duration
 
             if day_slots:
                 try:
