@@ -1,5 +1,6 @@
 import os
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -10,12 +11,26 @@ from tools import create_calendar_event, find_events, update_calendar_event, fin
 import datetime
 from tzlocal import get_localzone_name
 
+# Load environment variables
 load_dotenv()
 
+# Check for GOOGLE_API_KEY
 if os.getenv("GOOGLE_API_KEY") is None:
     raise Exception("GOOGLE_API_KEY not found. Please set it in .env file.")
 
-app = FastAPI()
+# Initialize FastAPI app
+app = FastAPI(title="Calendar Assistant API",
+             description="A powerful calendar assistant that can create, find, and update Google Calendar events.",
+             version="1.0.0")
+
+# Configure CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, replace with your frontend URL
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
 
