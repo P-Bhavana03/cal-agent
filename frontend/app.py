@@ -1,12 +1,16 @@
 import streamlit as st
 import requests
 import json
+import os
 
 st.title("📅 Calendar Scheduling Assistant")
 
 # Initialize session state
 if "messages" not in st.session_state:
     st.session_state.messages = []
+
+# Get backend URL from environment variable or use localhost as fallback
+BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:8000")
 
 def send_message(message):
     """Helper function to send a message and get response from backend"""
@@ -17,7 +21,7 @@ def send_message(message):
     try:
         payload = {"query": message}
         
-        response = requests.post("http://127.0.0.1:8000/chat", json=payload)
+        response = requests.post(f"{BACKEND_URL}/chat", json=payload)
         response.raise_for_status()
         
         backend_response = response.json()
